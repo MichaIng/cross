@@ -9,10 +9,8 @@ on:
         required: false
         type: string
         description: Used to checkout a specific ref, instead of the default ref with `actions/checkout` action
-  pull_request:
   merge_group:
   push:
-    branches: [main, staging, trying]
     tags:
       - "v*.*.*"
 
