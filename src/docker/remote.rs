@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, BufRead, Read, Write};
 use std::path::Path;
 use std::process::{Command, ExitStatus};
@@ -6,9 +6,12 @@ use std::{env, fs, time};
 
 use eyre::Context;
 use is_terminal::IsTerminal;
+use serde::Deserialize;
 
+use super::docker_ignore::DockerIgnore;
 use super::engine::Engine;
 use super::shared::*;
+use crate::TargetTriple;
 use crate::config::bool_from_envvar;
 use crate::errors::Result;
 use crate::extensions::CommandExt;
@@ -16,7 +19,6 @@ use crate::file::{self, PathExt, ToUtf8};
 use crate::rustc::{self, QualifiedToolchain, VersionMetaExt};
 use crate::shell::MessageInfo;
 use crate::temp;
-use crate::TargetTriple;
 
 // prevent further commands from running if we handled
 // a signal earlier, and the volume is exited.
@@ -104,21 +106,41 @@ impl ContainerDataVolume<'_, '_, '_> {
     ///
     /// if copying from a src directory to dst directory with docker, to
     /// copy the contents from `src` into `dst`, `src` must end with `/.`
+    /// copy files for a docker volume, filtering out cache directories and dockerignore
+    #[allow(clippy::too_many_arguments)]
     #[track_caller]
-    fn copy_files_nocache(
+    fn copy_files_filtered(
         &self,
         src: &Path,
         reldst: &str,
         mount_prefix: &str,
         copy_symlinks: bool,
+        copy_cache: bool,
+        dockerignore: &DockerIgnore,
         msg_info: &mut MessageInfo,
     ) -> Result<ExitStatus> {
-        // avoid any cached directories when copying
-        // see https://bford.info/cachedir/
+        if dockerignore.is_empty() && copy_cache {
+            return self.copy_files(&src.join("."), reldst, mount_prefix, msg_info);
+        }
+
         // SAFETY: safe, single-threaded execution.
         let tempdir = unsafe { temp::TempDir::new()? };
         let temppath = tempdir.path();
-        let had_symlinks = copy_dir(src, temppath, copy_symlinks, 0, |e, _| is_cachedir(e))?;
+        let had_symlinks = copy_dir_with_rel(
+            src,
+            src,
+            temppath,
+            copy_symlinks,
+            0,
+            |e, _, rel_path, is_dir| {
+                (!copy_cache && is_cachedir(e))
+                    || if is_dir {
+                        dockerignore.is_dir_ignored(rel_path)
+                    } else {
+                        dockerignore.is_ignored(rel_path, false)
+                    }
+            },
+        )?;
         warn_symlinks(had_symlinks, msg_info)?;
         self.copy_files(&temppath.join("."), reldst, mount_prefix, msg_info)
     }
@@ -217,9 +239,8 @@ impl ContainerDataVolume<'_, '_, '_> {
     ) -> Result<()> {
         let dirs = &self.toolchain_dirs;
         let reldst = dirs.cargo_mount_path_relative()?;
-        let copy_registry = env::var("CROSS_REMOTE_COPY_REGISTRY")
-            .map(|s| bool_from_envvar(&s))
-            .unwrap_or(copy_registry);
+        let copy_registry =
+            env::var("CROSS_REMOTE_COPY_REGISTRY").map_or(copy_registry, |s| bool_from_envvar(&s));
 
         self.create_dir(&reldst, mount_prefix, msg_info)?;
         if copy_registry {
@@ -307,7 +328,7 @@ impl ContainerDataVolume<'_, '_, '_> {
             &temppath.join(rustlib),
             true,
             0,
-            |e, d| d != 0 || e.file_type().map(|t| !t.is_file()).unwrap_or(true),
+            |e, d| d != 0 || e.file_type().map_or(true, |t| !t.is_file()),
         )?;
         self.copy_files(&temppath.join("lib"), &reldst, mount_prefix, msg_info)?;
 
@@ -384,12 +405,17 @@ impl ContainerDataVolume<'_, '_, '_> {
         copy_cache: bool,
         msg_info: &mut MessageInfo,
     ) -> Result<()> {
+        let dockerignore = DockerIgnore::from_dir(src, self.engine.kind, msg_info)?;
         let copy_all = |info: &mut MessageInfo| {
-            if copy_cache {
-                self.copy_files(&src.join("."), reldst, mount_prefix, info)
-            } else {
-                self.copy_files_nocache(&src.join("."), reldst, mount_prefix, true, info)
-            }
+            self.copy_files_filtered(
+                src,
+                reldst,
+                mount_prefix,
+                true,
+                copy_cache,
+                &dockerignore,
+                info,
+            )
         };
         match volume {
             VolumeId::Keep(_) => {
@@ -399,7 +425,7 @@ impl ContainerDataVolume<'_, '_, '_> {
                 let toolchain = &self.toolchain_dirs.toolchain();
                 let filename = toolchain.unique_mount_identifier(src)?;
                 let fingerprint = parent.join(filename);
-                let current = Fingerprint::read_dir(src, copy_cache)?;
+                let current = Fingerprint::read_dir(src, copy_cache, &dockerignore)?;
                 // need to check if the container path exists, otherwise we might
                 // have stale data: the persistent volume was deleted & recreated.
                 if fingerprint.exists()
@@ -442,7 +468,7 @@ fn is_cachedir_tag(path: &Path) -> Result<bool> {
 fn is_cachedir(entry: &fs::DirEntry) -> bool {
     // avoid any cached directories when copying
     // see https://bford.info/cachedir/
-    if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+    if entry.file_type().is_ok_and(|t| t.is_dir()) {
         let path = entry.path().join("CACHEDIR.TAG");
         path.exists() && is_cachedir_tag(&path).unwrap_or(false)
     } else {
@@ -450,7 +476,79 @@ fn is_cachedir(entry: &fs::DirEntry) -> bool {
     }
 }
 
-// recursively copy a directory into another
+// iteratively copy a directory into another with relative path information for skip callback
+fn copy_dir_with_rel<Skip>(
+    root: &Path,
+    src: &Path,
+    dst: &Path,
+    copy_symlinks: bool,
+    depth: u32,
+    skip: Skip,
+) -> Result<bool>
+where
+    Skip: Copy + Fn(&fs::DirEntry, u32, &str, bool) -> bool,
+{
+    let mut had_symlinks = false;
+    let mut queue = VecDeque::from([(src.to_path_buf(), dst.to_path_buf(), depth)]);
+
+    while let Some((src_dir, dst_dir, depth)) = queue.pop_front() {
+        for entry in fs::read_dir(&src_dir)
+            .wrap_err_with(|| format!("when reading directory {src_dir:?}"))?
+        {
+            let file = entry?;
+            let src_path = file.path();
+            let file_type = file.file_type()?;
+            let is_dir = file_type.is_dir();
+            let rel_path = src_path
+                .strip_prefix(root)
+                .wrap_err_with(|| format!("when stripping prefix {root:?} from {src_path:?}"))?
+                .as_posix_relative()?;
+
+            if skip(&file, depth, &rel_path, is_dir) {
+                continue;
+            }
+
+            let dst_path = dst_dir.join(file.file_name());
+            if file_type.is_file() {
+                fs::copy(&src_path, &dst_path)
+                    .wrap_err_with(|| format!("when copying file {src_path:?} -> {dst_path:?}"))?;
+            } else if is_dir {
+                fs::create_dir(&dst_path).ok();
+                queue.push_back((src_path, dst_path, depth + 1));
+            } else if file_type.is_symlink() && copy_symlinks {
+                had_symlinks = true;
+                let link_dst = fs::read_link(&src_path)?;
+
+                #[cfg(target_family = "unix")]
+                {
+                    std::os::unix::fs::symlink(link_dst, &dst_path)?;
+                }
+
+                #[cfg(target_family = "windows")]
+                {
+                    let link_dst_absolute = if link_dst.is_absolute() {
+                        link_dst.clone()
+                    } else {
+                        // we cannot fail even if the linked to path does not exist.
+                        src_dir.join(&link_dst)
+                    };
+                    if link_dst_absolute.is_dir() {
+                        std::os::windows::fs::symlink_dir(link_dst, &dst_path)?;
+                    } else {
+                        // symlink_file handles everything that isn't a directory
+                        std::os::windows::fs::symlink_file(link_dst, &dst_path)?;
+                    }
+                }
+            } else {
+                had_symlinks = true;
+            }
+        }
+    }
+
+    Ok(had_symlinks)
+}
+
+// iteratively copy a directory into another
 fn copy_dir<Skip>(
     src: &Path,
     dst: &Path,
@@ -461,52 +559,7 @@ fn copy_dir<Skip>(
 where
     Skip: Copy + Fn(&fs::DirEntry, u32) -> bool,
 {
-    let mut had_symlinks = false;
-
-    for entry in fs::read_dir(src).wrap_err_with(|| format!("when reading directory {src:?}"))? {
-        let file = entry?;
-        if skip(&file, depth) {
-            continue;
-        }
-
-        let src_path = file.path();
-        let dst_path = dst.join(file.file_name());
-        if file.file_type()?.is_file() {
-            fs::copy(&src_path, &dst_path)
-                .wrap_err_with(|| format!("when copying file {src_path:?} -> {dst_path:?}"))?;
-        } else if file.file_type()?.is_dir() {
-            fs::create_dir(&dst_path).ok();
-            had_symlinks = copy_dir(&src_path, &dst_path, copy_symlinks, depth + 1, skip)?;
-        } else if copy_symlinks {
-            had_symlinks = true;
-            let link_dst = fs::read_link(src_path)?;
-
-            #[cfg(target_family = "unix")]
-            {
-                std::os::unix::fs::symlink(link_dst, dst_path)?;
-            }
-
-            #[cfg(target_family = "windows")]
-            {
-                let link_dst_absolute = if link_dst.is_absolute() {
-                    link_dst.clone()
-                } else {
-                    // we cannot fail even if the linked to path does not exist.
-                    src.join(&link_dst)
-                };
-                if link_dst_absolute.is_dir() {
-                    std::os::windows::fs::symlink_dir(link_dst, dst_path)?;
-                } else {
-                    // symlink_file handles everything that isn't a directory
-                    std::os::windows::fs::symlink_file(link_dst, dst_path)?;
-                }
-            }
-        } else {
-            had_symlinks = true;
-        }
-    }
-
-    Ok(had_symlinks)
+    copy_dir_with_rel(src, src, dst, copy_symlinks, depth, |e, d, _, _| skip(e, d))
 }
 
 fn warn_symlinks(had_symlinks: bool, msg_info: &mut MessageInfo) -> Result<()> {
@@ -515,6 +568,102 @@ fn warn_symlinks(had_symlinks: bool, msg_info: &mut MessageInfo) -> Result<()> {
     } else {
         Ok(())
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoCompilerArtifact {
+    reason: String,
+    package_id: String,
+    filenames: Vec<String>,
+    executable: Option<String>,
+}
+
+/// Artifacts of workspace members have `path+file://` package ids,
+/// while registry and git dependencies have `registry+`/`git+` ids.
+/// Only the former should be copied back to the host.
+fn is_workspace_artifact(artifact: &CargoCompilerArtifact) -> bool {
+    artifact.package_id.starts_with("path+file://")
+}
+
+fn is_intermediate_artifact(path: &str) -> bool {
+    path.contains("/deps/") && (path.ends_with("rlib") || path.ends_with("rmeta"))
+        || path.ends_with("build-script-build")
+}
+
+/// Returns `true` when `line` is one of cargo's `--message-format=json`
+/// machine messages. Such lines are needed only for artifact discovery and
+/// must be captured silently instead of being printed to the user's stdout.
+fn is_cargo_json_message(line: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(line.trim())
+        .map(|value| value.get("reason").is_some())
+        .unwrap_or(false)
+}
+
+fn parse_artifact_filenames(json_output: &str) -> Vec<String> {
+    let mut filenames = Vec::new();
+    for line in json_output.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(artifact) = serde_json::from_str::<CargoCompilerArtifact>(line) {
+            if artifact.reason == "compiler-artifact" && is_workspace_artifact(&artifact) {
+                for f in artifact.filenames {
+                    if is_intermediate_artifact(&f) {
+                        continue;
+                    }
+                    if !filenames.contains(&f) {
+                        filenames.push(f);
+                    }
+                }
+                // Executables are final products even when cargo places
+                // them under `deps/` (e.g. test binaries).
+                if let Some(exe) = artifact.executable {
+                    if !filenames.contains(&exe) {
+                        filenames.push(exe);
+                    }
+                }
+            }
+        }
+    }
+    filenames
+}
+
+fn copy_artifacts_from_container(
+    engine: &Engine,
+    container_id: &str,
+    artifact_files: &[String],
+    host_target_dir: &Path,
+    mount_target_dir: &str,
+    msg_info: &mut MessageInfo,
+) -> Result<()> {
+    for artifact_path in artifact_files {
+        let artifact_path = artifact_path.trim();
+        if artifact_path.is_empty() {
+            continue;
+        }
+
+        let relative = if let Some(pos) = artifact_path.find(mount_target_dir) {
+            &artifact_path[pos + mount_target_dir.len()..]
+        } else {
+            msg_info.warn(format_args!(
+                "artifact path {artifact_path} does not start with {mount_target_dir}, skipping"
+            ))?;
+            continue;
+        };
+
+        let host_path = host_target_dir.join(relative.trim_start_matches('/'));
+
+        if let Some(parent) = host_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        subcommand_or_exit(engine, "cp")?
+            .arg(format!("{container_id}:{artifact_path}"))
+            .arg(&host_path)
+            .run_and_get_status(msg_info, false)?;
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -559,31 +708,51 @@ impl Fingerprint {
         Ok(())
     }
 
-    fn _read_dir(&mut self, home: &Path, path: &Path, copy_cache: bool) -> Result<()> {
-        for entry in fs::read_dir(path)? {
-            let file = entry?;
-            let file_type = file.file_type()?;
-            // only parse known files types: 0 or 1 of these tests can pass.
-            if file_type.is_dir() {
-                if copy_cache || !is_cachedir(&file) {
-                    self._read_dir(home, &path.join(file.file_name()), copy_cache)?;
-                }
-            } else if file_type.is_file() || file_type.is_symlink() {
-                // we're mounting to the same location, so this should fine
-                // we need to round the modified date to millis.
-                let modified = file.metadata()?.modified()?;
-                let rounded = time_from_millis(time_to_millis(&modified)?);
+    fn _read_dir(
+        &mut self,
+        home: &Path,
+        path: &Path,
+        copy_cache: bool,
+        dockerignore: &DockerIgnore,
+    ) -> Result<()> {
+        let mut queue = VecDeque::from([path.to_path_buf()]);
+
+        while let Some(dir) = queue.pop_front() {
+            for entry in fs::read_dir(&dir)? {
+                let file = entry?;
+                let file_type = file.file_type()?;
+                let is_dir = file_type.is_dir();
                 let relpath = file.path().strip_prefix(home)?.as_posix_relative()?;
-                self.map.insert(relpath, rounded);
+                let ignored = if is_dir {
+                    dockerignore.is_dir_ignored(&relpath)
+                } else {
+                    dockerignore.is_ignored(&relpath, false)
+                };
+                if ignored {
+                    continue;
+                }
+
+                // only parse known files types: 0 or 1 of these tests can pass.
+                if is_dir {
+                    if copy_cache || !is_cachedir(&file) {
+                        queue.push_back(dir.join(file.file_name()));
+                    }
+                } else if file_type.is_file() || file_type.is_symlink() {
+                    // we're mounting to the same location, so this should fine
+                    // we need to round the modified date to millis.
+                    let modified = file.metadata()?.modified()?;
+                    let rounded = time_from_millis(time_to_millis(&modified)?);
+                    self.map.insert(relpath, rounded);
+                }
             }
         }
 
         Ok(())
     }
 
-    fn read_dir(home: &Path, copy_cache: bool) -> Result<Fingerprint> {
+    fn read_dir(home: &Path, copy_cache: bool, dockerignore: &DockerIgnore) -> Result<Fingerprint> {
         let mut result = Fingerprint::new();
-        result._read_dir(home, home, copy_cache)?;
+        result._read_dir(home, home, copy_cache, dockerignore)?;
         Ok(result)
     }
 
@@ -868,16 +1037,32 @@ pub(crate) fn run(
         }
     }
 
+    let skip_artifacts = env::var("CROSS_REMOTE_SKIP_BUILD_ARTIFACTS")
+        .map(|s| bool_from_envvar(&s))
+        .unwrap_or_default();
+    // Copy the full target directory back to the host instead of only the
+    // compiler artifacts, e.g. when build scripts emit files (OUT_DIR
+    // contents, generated code) that must be available on the host.
+    let copy_full_target_dir = env::var("CROSS_REMOTE_COPY_FULL_TARGET_DIR")
+        .map(|s| bool_from_envvar(&s))
+        .unwrap_or_default();
+
     let mut cmd = options.command_variant.safe_command();
 
     if msg_info.should_fail() {
         return Ok(None);
     }
 
+    let produces_artifacts = matches!(
+        subcommand,
+        Some(crate::Subcommand::Build)
+            | Some(crate::Subcommand::Run)
+            | Some(crate::Subcommand::Test)
+            | Some(crate::Subcommand::Bench)
+            | Some(crate::Subcommand::Rustc)
+    );
+
     if !options.command_variant.is_shell() {
-        // `clean` doesn't handle symlinks: it will just unlink the target
-        // directory, so we should just substitute it our target directory
-        // for it. we'll still have the same end behavior
         let mut final_args = vec![];
         let mut iter = args.iter().cloned();
         let mut has_target_dir = false;
@@ -902,9 +1087,16 @@ pub(crate) fn run(
             final_args.push(target_dir.clone());
         }
 
+        if produces_artifacts && !skip_artifacts && !copy_full_target_dir {
+            final_args.push("--message-format=json".to_owned());
+        }
+
         cmd.args(final_args);
     } else {
         cmd.args(args);
+        if produces_artifacts && !skip_artifacts && !copy_full_target_dir {
+            cmd.arg(&"--message-format=json".to_owned());
+        }
     }
 
     // 5. create symlinks for copied data
@@ -960,31 +1152,254 @@ symlink_recurse \"${{prefix}}\"
     }
 
     bail_container_exited!();
-    let status = docker.run_and_get_status(msg_info, false);
+
+    let (status, command_stdout) =
+        docker.run_and_get_output_streamed(msg_info, |line| !is_cargo_json_message(line))?;
+    // Per-artifact copies should land inside the host target directory
+    // itself, e.g. <project>/target/<triple>/debug/<bin>.
+    let host_target_dir = package_dirs.target().to_owned();
+    // `docker cp` of a directory into an existing directory creates
+    // <dest>/<source-basename>, so the full-directory fallback must use
+    // the project root to reproduce <project>/target.
+    let host_root_dir = package_dirs
+        .target()
+        .parent()
+        .expect("target directory should have a parent");
 
     // 7. copy data from our target dir back to host
-    // this might not exist if we ran `clean`.
-    let skip_artifacts = env::var("CROSS_REMOTE_SKIP_BUILD_ARTIFACTS")
-        .map(|s| bool_from_envvar(&s))
-        .unwrap_or_default();
     bail_container_exited!();
     let mount_target_dir = format!("{}/{}", package_dirs.mount_root(), target_dir);
+
     if !skip_artifacts
         && data_volume.container_path_exists(&mount_target_dir, mount_prefix, msg_info)?
     {
-        subcommand_or_exit(engine, "cp")?
-            .arg("-a")
-            .arg(format!("{container_id}:{mount_target_dir}",))
-            .arg(
-                package_dirs
-                    .target()
-                    .parent()
-                    .expect("target directory should have a parent"),
-            )
-            .run_and_get_status(msg_info, false)?;
+        if produces_artifacts && !copy_full_target_dir {
+            let artifact_files = parse_artifact_filenames(&command_stdout);
+
+            if !artifact_files.is_empty() {
+                copy_artifacts_from_container(
+                    engine,
+                    &container_id,
+                    &artifact_files,
+                    &host_target_dir,
+                    &mount_target_dir,
+                    msg_info,
+                )?;
+            } else {
+                subcommand_or_exit(engine, "cp")?
+                    .arg("-a")
+                    .arg(format!("{container_id}:{mount_target_dir}"))
+                    .arg(host_root_dir)
+                    .run_and_get_status(msg_info, false)?;
+            }
+        } else {
+            subcommand_or_exit(engine, "cp")?
+                .arg("-a")
+                .arg(format!("{container_id}:{mount_target_dir}"))
+                .arg(host_root_dir)
+                .run_and_get_status(msg_info, false)?;
+        }
     }
 
     ChildContainer::finish_static(is_tty, msg_info);
 
-    status.map(Some)
+    Ok(Some(status))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_cargo_json_message, parse_artifact_filenames};
+    use crate::docker::EngineType;
+
+    #[test]
+    fn cargo_json_message_detection() {
+        assert!(is_cargo_json_message(
+            r#"{"reason":"compiler-artifact","package_id":"path+file:///project/hello","target":{"kind":["bin"],"name":"hello"},"profile":{"opt_level":"s"},"features":[],"filenames":["/project/target/debug/hello"],"executable":"/project/target/debug/hello"}"#
+        ));
+        assert!(is_cargo_json_message(
+            r#"{"reason":"build-finished","success":true}"#
+        ));
+        assert!(is_cargo_json_message(
+            r#"{"reason":"compiler-message","message":{"level":"warning","message":"unused"}}"#
+        ));
+        assert!(!is_cargo_json_message("Hello, world!"));
+        assert!(!is_cargo_json_message(""));
+        assert!(!is_cargo_json_message("not json at all"));
+        assert!(!is_cargo_json_message(r#"{"without":"a reason key"}"#));
+        assert!(!is_cargo_json_message("   "));
+    }
+
+    #[test]
+    fn parse_workspace_artifacts() {
+        let json = r#"{"reason":"compiler-artifact","package_id":"path+file:///project/hello","target":{"kind":["bin"],"name":"hello"},"profile":{"opt_level":"s"},"features":[],"filenames":["/project/target/debug/hello","/project/target/debug/hello.d"],"executable":"/project/target/debug/hello"}"#;
+        let out = parse_artifact_filenames(json);
+        assert_eq!(
+            out,
+            vec![
+                "/project/target/debug/hello",
+                "/project/target/debug/hello.d",
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_skips_deps_artifacts_keeps_executable() {
+        let json = concat!(
+            r#"{"reason":"compiler-artifact","package_id":"path+file:///project/lib","target":{"kind":["lib"],"name":"lib"},"profile":{"opt_level":"s"},"features":[],"filenames":["/project/target/debug/deps/liblib-abc123.rlib","/project/target/debug/deps/liblib-abc123.rmeta","/project/target/debug/deps/liblib-abc123.d"],"executable":null}"#,
+            "\n",
+            r#"{"reason":"compiler-artifact","package_id":"path+file:///project/app","target":{"kind":["bin"],"name":"app"},"profile":{"opt_level":"s"},"features":[],"filenames":["/project/target/debug/app","/project/target/debug/deps/app-def456"],"executable":"/project/target/debug/app"}"#,
+            "\n",
+            r#"{"reason":"compiler-artifact","package_id":"path+file:///project/itest","target":{"kind":["test"],"name":"itest"},"profile":{"test":true,"opt_level":"s"},"features":[],"filenames":["/project/target/debug/deps/itest-789abc"],"executable":"/project/target/debug/deps/itest-789abc"}"#,
+        );
+        let out = parse_artifact_filenames(json);
+        assert_eq!(
+            out,
+            vec![
+                "/project/target/debug/deps/liblib-abc123.d",
+                "/project/target/debug/app",
+                "/project/target/debug/deps/app-def456",
+                "/project/target/debug/deps/itest-789abc"
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_skips_program_output_and_non_workspace() {
+        let json = concat!(
+            "Hello, world!\n",
+            r#"{"reason":"compiler-artifact","package_id":"registry+https://github.com/rust-lang/crates.io-index#serde@1.0.0","target":{"kind":["lib"],"name":"serde"},"profile":{"opt_level":"s"},"features":[],"filenames":["/project/target/debug/deps/libserde.rlib"],"executable":null}"#,
+            "\n",
+            r#"{"reason":"build-finished","success":true}"#,
+        );
+        assert!(parse_artifact_filenames(json).is_empty());
+    }
+
+    #[test]
+    fn parse_skips_empty_input() {
+        assert!(parse_artifact_filenames("").is_empty());
+        assert!(parse_artifact_filenames("\n  \n").is_empty());
+    }
+
+    #[test]
+    fn test_dockerignore_copy_dir_with_rel() {
+        let src_temp = tempfile::tempdir().unwrap();
+        let dst_temp = tempfile::tempdir().unwrap();
+        let src = src_temp.path();
+        let dst = dst_temp.path();
+
+        std::fs::create_dir_all(src.join("src")).unwrap();
+        std::fs::create_dir_all(src.join("target/debug")).unwrap();
+        std::fs::create_dir_all(src.join("logs")).unwrap();
+        std::fs::create_dir_all(src.join("temp")).unwrap();
+
+        std::fs::write(src.join("Cargo.toml"), "cargo").unwrap();
+        std::fs::write(src.join("src/main.rs"), "fn main() {}").unwrap();
+        std::fs::write(src.join("target/debug/app"), "binary").unwrap();
+        std::fs::write(src.join("logs/app.log"), "log").unwrap();
+        std::fs::write(src.join("temp/delete.txt"), "delete").unwrap();
+        std::fs::write(src.join("temp/keep.txt"), "keep").unwrap();
+
+        let ignore_content = r#"target/
+logs
+temp/*
+!temp/keep.txt
+"#;
+        let di = super::DockerIgnore::parse(ignore_content).unwrap();
+
+        super::copy_dir_with_rel(src, src, dst, false, 0, |_, _, rel_path, is_dir| {
+            di.is_ignored(rel_path, is_dir)
+        })
+        .unwrap();
+
+        assert!(dst.join("Cargo.toml").exists());
+        assert!(dst.join("src/main.rs").exists());
+        assert!(dst.join("temp/keep.txt").exists());
+
+        assert!(!dst.join("target").exists());
+        assert!(!dst.join("logs").exists());
+        assert!(!dst.join("temp/delete.txt").exists());
+    }
+
+    #[test]
+    fn test_dockerignore_fingerprint() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "// code").unwrap();
+        std::fs::write(root.join("target/artifact"), "build").unwrap();
+        std::fs::write(root.join("debug.log"), "log").unwrap();
+        std::fs::write(
+            root.join(".dockerignore"),
+            r#"target/
+*.log
+"#,
+        )
+        .unwrap();
+
+        let di = super::DockerIgnore::from_dir(root, EngineType::Docker, &mut Default::default())
+            .unwrap();
+        let fp = super::Fingerprint::read_dir(root, true, &di).unwrap();
+
+        assert!(fp.map.contains_key("src/lib.rs"));
+        assert!(fp.map.contains_key(".dockerignore"));
+        assert!(!fp.map.contains_key("target/artifact"));
+        assert!(!fp.map.contains_key("debug.log"));
+    }
+
+    #[test]
+    fn test_dockerignore_copy_dir_with_dir_exception() {
+        let src_temp = tempfile::tempdir().unwrap();
+        let dst_temp = tempfile::tempdir().unwrap();
+        let src = src_temp.path();
+        let dst = dst_temp.path();
+
+        std::fs::create_dir_all(src.join("target/debug")).unwrap();
+        std::fs::write(src.join("target/debug/app"), "binary").unwrap();
+        std::fs::write(src.join("target/keep.txt"), "keep").unwrap();
+        std::fs::write(src.join("target/delete.txt"), "delete").unwrap();
+
+        let ignore_content = r#"target/
+!target/keep.txt
+"#;
+        let di = super::DockerIgnore::parse(ignore_content).unwrap();
+
+        super::copy_dir_with_rel(src, src, dst, false, 0, |_, _, rel_path, is_dir| {
+            if is_dir {
+                di.is_dir_ignored(rel_path)
+            } else {
+                di.is_ignored(rel_path, false)
+            }
+        })
+        .unwrap();
+
+        assert!(dst.join("target/keep.txt").exists());
+        assert!(!dst.join("target/delete.txt").exists());
+        assert!(!dst.join("target/debug").exists());
+    }
+
+    #[test]
+    fn test_dockerignore_fingerprint_with_dir_exception() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+
+        std::fs::create_dir_all(root.join("target/debug")).unwrap();
+        std::fs::write(root.join("target/debug/app"), "binary").unwrap();
+        std::fs::write(root.join("target/keep.txt"), "keep").unwrap();
+        std::fs::write(
+            root.join(".dockerignore"),
+            r#"target/
+!target/keep.txt
+"#,
+        )
+        .unwrap();
+
+        let di = super::DockerIgnore::from_dir(root, EngineType::Docker, &mut Default::default())
+            .unwrap();
+        let fp = super::Fingerprint::read_dir(root, true, &di).unwrap();
+
+        assert!(fp.map.contains_key("target/keep.txt"));
+        assert!(!fp.map.contains_key("target/debug/app"));
+    }
 }

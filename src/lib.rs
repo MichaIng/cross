@@ -58,14 +58,14 @@ use rustc::{QualifiedToolchain, Toolchain};
 use rustc_version::Channel;
 use serde::{Deserialize, Serialize, Serializer};
 
-pub use self::cargo::{cargo_command, cargo_metadata_with_args, CargoMetadata, Subcommand};
+pub use self::cargo::{CargoMetadata, Subcommand, cargo_command, cargo_metadata_with_args};
 use self::cross_toml::CrossToml;
 use self::errors::Context;
 use self::shell::{MessageInfo, Verbosity};
 
-pub use self::errors::{install_panic_hook, install_termination_hook, Result};
+pub use self::errors::{Result, install_panic_hook, install_termination_hook};
 pub use self::extensions::{CommandExt, OutputExt, SafeCommand};
-pub use self::file::{pretty_path, ToUtf8};
+pub use self::file::{ToUtf8, pretty_path};
 pub use self::rustc::{TargetList, VersionMetaExt};
 
 pub const CROSS_LABEL_DOMAIN: &str = "org.cross-rs";
@@ -770,6 +770,28 @@ pub fn setup(
         }
         Err(err) => {
             msg_info.warn(err)?;
+
+            let target_triple = target.triple();
+            let host_triple = host.triple();
+            let native_targets = [
+                "x86_64-pc-windows-msvc",
+                "x86_64-apple-darwin",
+                "aarch64-apple-darwin",
+            ];
+            if native_targets.contains(&target_triple) {
+                if target_triple == host_triple {
+                    msg_info.note(format_args!(
+                        "target `{target_triple}` is the same as the host; \
+                         try running `cargo` directly instead of `cross`."
+                    ))?;
+                } else {
+                    msg_info.note(format_args!(
+                        "`cross` does not natively support target `{target_triple}`. \
+                         See <https://github.com/cross-rs/cross-toolchains> for pre-built \
+                         Docker images for additional targets."
+                    ))?;
+                }
+            }
 
             return Ok(None);
         }
